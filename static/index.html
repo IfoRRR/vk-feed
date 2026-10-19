@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#07070f" />
+  <title>VK Feed Lab — Demo</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;800&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/demo-theme.css" />
+  <link rel="stylesheet" href="style.css" />
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+</head>
+<body>
+  <nav class="demo-nav">
+    <a href="/" class="demo-nav-link">← Назад в портфолио</a>
+    <span class="demo-nav-title">vk feed · likes</span>
+  </nav>
+
+  <div id="app" class="demo-page">
+    <header class="demo-header">
+      <span class="demo-label">vk feed lab</span>
+      <h1 class="demo-title">Лента + счётчики</h1>
+      <p class="demo-subtitle">Подписки · cursor-пагинация · идемпотентные лайки · Redis hot-cache</p>
+    </header>
+
+    <section class="toolbar glass">
+      <label>
+        <span class="field-label">Я</span>
+        <select v-model.number="userId" class="field-input" @change="reload">
+          <option v-for="u in users" :key="u.id" :value="u.id">{{ u.display_name }} (@{{ u.username }})</option>
+        </select>
+      </label>
+      <label class="grow">
+        <span class="field-label">Новый пост</span>
+        <input v-model="draft" class="field-input" maxlength="500" placeholder="Что нового?" @keyup.enter="publish" />
+      </label>
+      <button class="btn btn-primary" :disabled="!draft.trim()" @click="publish">Опубликовать</button>
+    </section>
+
+    <p v-if="meta" class="meta mono">{{ meta }}</p>
+    <p v-if="error" class="error">{{ error }}</p>
+
+    <section class="feed">
+      <article v-for="p in posts" :key="p.id" class="post glass">
+        <header class="post-head">
+          <strong>{{ p.author_name }}</strong>
+          <span class="mono muted">@{{ p.author_username }}</span>
+          <time class="muted">{{ formatTime(p.created_at) }}</time>
+        </header>
+        <p class="post-body">{{ p.body }}</p>
+        <footer class="post-foot">
+          <button class="btn btn-outline" @click="like(p)">
+            {{ p.liked_by_me ? '♥' : '♡' }} {{ p.likes_count }}
+          </button>
+          <span v-if="p._likeHint" class="mono muted">{{ p._likeHint }}</span>
+        </footer>
+      </article>
+      <p v-if="!posts.length && !loading" class="empty">Лента пуста — подпишись или напиши пост</p>
+    </section>
+
+    <button v-if="nextCursor" class="btn btn-outline more" :disabled="loading" @click="loadMore">
+      {{ loading ? '…' : 'Ещё' }}
+    </button>
+  </div>
+
+  <script>
+    const { createApp } = Vue
+    const API = '/api/feed'
+
+    createApp({
+      data() {
+        return {
+          users: [],
+          userId: 1,
+          posts: [],
+          draft: '',
+          nextCursor: '',
+          loading: false,
+          error: '',
+          meta: '',
+        }
+      },
+      async mounted() {
+        await this.loadUsers()
+        await this.reload()
+      },
+      methods: {
+        async loadUsers() {
+          const res = await fetch(`${API}/users`)
+          const data = await res.json()
+          this.users = data.users || []
+          if (this.users.length && !this.users.find(u => u.id === this.userId)) {
+            this.userId = this.users[0].id
+          }
+        },
+        async reload() {
+          this.posts = []
+          this.nextCursor = ''
+          await this.fetchPage('')
+        },
+        async loadMore() {
+          if (!this.nextCursor) return
+          await this.fetchPage(this.nextCursor)
+        },
+        async fetchPage(cursor) {
+          this.loading = true
+          this.error = ''
+          try {
+            const q = new URLSearchParams({ user_id: this.userId, limit: 10 })
+            if (cursor) q.set('cursor', cursor)
+            const res = await fetch(`${API}/feed?${q}`)
+            if (!res.ok) throw new Error(`HTTP ${res.status}`)
+            const data = await res.json()
+            this.posts = cursor ? this.posts.concat(data.posts || []) : (data.posts || [])
+            this.nextCursor = data.next_cursor || ''
+            this.meta = data.cached ? 'feed cache hit (Redis)' : 'feed from PostgreSQL'
+          } catch (e) {
+            this.error = e.message
+          } finally {
+            this.loading = false
+          }
+        },
+        async publish() {
+          const body = this.draft.trim()
+          if (!body) return
+          this.error = ''
+          try {
+            const res = await fetch(`${API}/posts`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ user_id: this.userId, body }),
+            })
+            if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `HTTP ${res.status}`)
+            this.draft = ''
+            await this.reload()
+          } catch (e) {
+            this.error = e.message
+          }
+        },
+        async like(p) {
+          this.error = ''
+          try {
+            const res = await fetch(`${API}/posts/${p.id}/like`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ user_id: this.userId }),
+            })
+            const data = await res.json()
+            if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
+            p.likes_count = data.likes_count
+            p.liked_by_me = true
+            p._likeHint = data.created ? 'лайк записан' : 'идемпотентно: уже лайкал'
+          } catch (e) {
+            this.error = e.message
+          }
+        },
+        formatTime(v) {
+          if (!v) return ''
+          return new Date(v).toLocaleString('ru-RU', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })
+        },
+      },
+    }).mount('#app')
+  </script>
+</body>
+</html>
